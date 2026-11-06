@@ -127,12 +127,14 @@ def review_log(result, flags, uploaded):
         auto = flags.loc[row.name]
         mine_only = [risk for risk in risks if not auto[risk]]
         auto_only = [risk for risk in flags.columns if auto[risk] and risk not in risks]
+        matched = len(risks) - len(mine_only)
+        compared = len(risks) + len(auto_only)
+        score = round(100 * matched / compared) if compared else 100
         records[key] = {
-            '원본 파일': uploaded.name, '파일 식별값': file_id, '전표번호': journal_id,
+            '전표번호': journal_id, '자동 탐지 기준 일치율 (%)': score,
             '내 우선순위': level, '내 위험지표': '\n'.join(risks),
             **{field: '\n'.join(values) for field, values in choices.items()},
             '자동 탐지 사유': row['Anomaly Reason'] or '탐지 없음',
-            '자동 탐지 점수': int(row['Risk Score']),
             '내 판단에만 있음': ', '.join(mine_only) or '없음',
             '자동 탐지에만 있음': ', '.join(auto_only) or '없음',
             '메모': memo.strip(),
@@ -140,9 +142,23 @@ def review_log(result, flags, uploaded):
         previous = records[key]
         st.success('판단을 저장했습니다.')
     if previous:
-        st.write(f"저장된 자동 탐지 결과 · {previous['자동 탐지 사유']} ({previous['자동 탐지 점수']}점)")
-    if records:
-        history = pd.DataFrame(records.values())
+        st.markdown('#### 채점 결과')
+        mine = set(previous.get('내 위험지표', '').splitlines())
+        detected = set(previous['자동 탐지 사유'].split('; ')) - {'탐지 없음'}
+        compared = len(mine | detected)
+        matched = len(mine & detected)
+        score = round(100 * matched / compared) if compared else 100
+        st.metric('자동 탐지 기준 일치율', f'{score}%')
+        st.caption(f'비교 대상 {compared}개 중 {matched}개 일치' if compared
+                   else '내 선택과 자동 탐지 모두 위험지표 없음')
+        st.write('**일치한 지표** · ' + (', '.join(sorted(mine & detected)) or '없음'))
+        st.write('**내가 추가로 선택한 지표** · ' + previous['내 판단에만 있음'])
+        st.write('**자동 탐지에만 나온 지표** · ' + previous['자동 탐지에만 있음'])
+        st.caption('일치율은 앱의 탐지 규칙과 비교한 점수입니다. 증빙과 메모는 검토 기록에 남습니다.')
+    current_records = [record for (source, _), record in records.items() if source == file_id]
+    if current_records:
+        history = pd.DataFrame(current_records).drop(
+            columns=['원본 파일', '파일 식별값', '자동 탐지 점수'], errors='ignore')
         st.dataframe(history, hide_index=True)
         st.download_button('감사 판단 기록 CSV 다운로드',
                            history.to_csv(index=False).encode('utf-8-sig'),
@@ -151,8 +167,42 @@ def review_log(result, flags, uploaded):
 
 
 def main():
-    st.set_page_config(page_title='GL Audit Dashboard', page_icon='🔎', layout='wide')
-    st.title('GL Audit Dashboard')
+    title = 'K-GAAS 부정위험요인 기반 분개장(JE) 자동 검증 대시보드'
+    st.set_page_config(page_title=title, page_icon='🔎', layout='wide')
+    st.markdown("""
+        <style>
+        .stMainBlockContainer {padding-top: 3.5rem; padding-bottom: 4rem;}
+        [data-testid="stMain"] {
+            background-image: linear-gradient(180deg, #7774d514, transparent 52rem);
+        }
+        .je-hero {
+            background: linear-gradient(115deg, #333581, #5153ad);
+            border-radius: 24px;
+            padding: clamp(1.4rem, 4vw, 3rem);
+            box-shadow: 0 14px 30px #393d811f;
+        }
+        .je-hero h1 {
+            color: #fff; font-size: clamp(1.45rem, 3vw, 2.5rem);
+            line-height: 1.35; letter-spacing: -.035em; padding: 0; margin: 0;
+        }
+        .je-hero p {
+            color: #d1d2e5; font-size: clamp(.8rem, 1.4vw, .98rem);
+            line-height: 1.55; font-weight: 600; margin: .65rem 0 0;
+        }
+        [data-testid="stMetric"] {
+            background: var(--st-secondary-background-color, #f5f4ff);
+            border: 1px solid #7778b539; border-radius: 16px;
+            padding: 1rem; box-shadow: 0 4px 14px #393d810a;
+        }
+        [data-testid="stMetricValue"] {font-weight: 700; font-variant-numeric: tabular-nums;}
+        [data-testid="stFileUploaderDropzone"] {border: 1px dashed #8587c9; border-radius: 16px;}
+        [data-testid="stDataFrame"] {border-radius: 12px; overflow: hidden;}
+        </style>
+        <header class="je-hero">
+          <h1>K-GAAS 부정위험요인 기반 분개장(JE) 자동 검증 대시보드</h1>
+          <p>Automated JE Scanner: K-GAAS Fraud Risk &amp; Anomaly Detection System</p>
+        </header>
+        """, unsafe_allow_html=True)
     st.caption('분개장 테스트 · 원화 기준 · 한 행당 차변/대변 한 쌍의 전표')
     with st.sidebar:
         st.header('탐지 설정')
@@ -182,17 +232,22 @@ def main():
         return
     result, flags = detect(df, lower, upper, revenue_accounts, allowed_debits)
     practice = st.checkbox('실습 모드 · 내 판단을 저장한 전표의 탐지 결과만 확인')
-    review_log(result, flags, uploaded)
     if practice:
+        review_log(result, flags, uploaded)
         return
     risky = flags.any(axis=1)
-    a, b = st.columns(2)
+    st.subheader('전표 검토 개요')
+    a, b, c = st.columns(3)
     a.metric('전체 전표 수', f'{len(df):,}')
     b.metric('위험 전표 수 · 중복 제외', f'{int(risky.sum()):,}',
              help='하나의 전표에서 여러 위험이 발견되어도 한 건으로 집계합니다.')
-    for card, name in zip(st.columns(5), flags.columns):
-        card.metric(name, f'{int(flags[name].sum()):,}')
-    st.caption('카드는 업로드 전체 기준입니다. 유형별 건수는 중복될 수 있습니다.')
+    c.metric('탐지 전표 비율', f'{risky.mean():.1%}')
+    st.markdown('**위험지표별 탐지 건수**')
+    st.bar_chart(flags.sum().rename_axis('위험지표').reset_index(name='전표 수'),
+                 x='위험지표', y='전표 수', color='#595bc3')
+    st.caption('업로드 전체 기준이며, 한 전표가 여러 위험지표에 집계될 수 있습니다.')
+    with st.expander('전표별 감사 판단 기록', expanded=True):
+        review_log(result, flags, uploaded)
     st.subheader('감사 우선 검토 · High Risk 상위 10건')
     priority = result.loc[flags.any(axis=1)].sort_values(
         ['Risk Score', 'Journal_ID'], ascending=[False, True], kind='stable'
